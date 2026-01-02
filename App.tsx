@@ -1,7 +1,6 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { HashRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
-
-import { User, Message } from './types';
+import { User, Saving, GalleryPhoto, Message } from './types';
 
 import Login from './pages/Login';
 import Dashboard from './pages/Dashboard';
@@ -13,115 +12,111 @@ import Layout from './components/Layout';
 
 import { db } from './services/databaseService';
 import { supabase, isSupabaseConfigured } from './services/supabaseClient';
-
-import { Heart as HeartIcon } from 'lucide-react';
+import { Heart, ShieldCheck } from 'lucide-react';
 
 const App: React.FC = () => {
-  const [user, setUser] = useState<User | null>(null);
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [users, setUsers] = useState<User[]>([]);
   const [messages, setMessages] = useState<Message[]>([]);
+  const [savings, setSavings] = useState<Saving[]>([]);
+  const [photos, setPhotos] = useState<GalleryPhoto[]>([]);
   const [loading, setLoading] = useState(true);
+  const [initError, setInitError] = useState<string | null>(null);
 
-  // ===============================
-  // LOAD USER & AUTH
-  // ===============================
+  const loadAllData = useCallback(async (uid: string) => {
+    const [u, m, s, p] = await Promise.all([
+      db.getAllUsers(),
+      db.getMessagesByUser(uid),
+      db.getSavings(),
+      db.getPhotos()
+    ]);
+
+    setUsers(u);
+    setMessages(m);
+    setSavings(s);
+    setPhotos(p);
+  }, []);
+
   useEffect(() => {
     if (!isSupabaseConfigured) {
-      console.error('Supabase belum dikonfigurasi');
+      setInitError('Supabase belum dikonfigurasi');
       setLoading(false);
       return;
     }
 
-    const initAuth = async () => {
-      const { data } = await supabase.auth.getSession();
-      const sessionUser = data.session?.user;
+    const init = async () => {
+      try {
+        const { data } = await supabase.auth.getSession();
+        const session = data.session;
 
-      if (!sessionUser) {
-        setUser(null);
+        if (session?.user) {
+          const profile = await db.getUser(session.user.id);
+          if (!profile) {
+            await supabase.auth.signOut();
+            setLoading(false);
+            return;
+          }
+
+          setCurrentUser(profile);
+          await loadAllData(profile.uid);
+        }
+      } catch (e: any) {
+        setInitError(e.message);
+      } finally {
         setLoading(false);
-        return;
       }
-
-      const profile = await db.getUser(sessionUser.id);
-      setUser(profile || null);
-      setLoading(false);
     };
 
-    initAuth();
+    init();
 
     const { data: listener } = supabase.auth.onAuthStateChange(
       async (_event, session) => {
-        if (!session?.user) {
-          setUser(null);
+        if (session?.user) {
+          const profile = await db.getUser(session.user.id);
+          if (profile) {
+            setCurrentUser(profile);
+            loadAllData(profile.uid);
+          }
+        } else {
+          setCurrentUser(null);
+          setUsers([]);
           setMessages([]);
-          return;
         }
-
-        const profile = await db.getUser(session.user.id);
-        setUser(profile || null);
       }
     );
 
     return () => {
       listener.subscription.unsubscribe();
     };
-  }, []);
+  }, [loadAllData]);
 
-  // ===============================
-  // LOAD USERS & MESSAGES
-  // ===============================
-  const loadInitialData = useCallback(async () => {
-    if (!user) return;
-
-    const [allUsers, allMessages] = await Promise.all([
-      db.getAllUsers(),
-      db.getMessagesByUser(user.uid),
-    ]);
-
-    setUsers(allUsers);
-    setMessages(allMessages);
-  }, [user]);
-
-  useEffect(() => {
-    loadInitialData();
-  }, [loadInitialData]);
-
-  // ===============================
-  // LOADING SCREEN (ANTI STUCK)
-  // ===============================
   if (loading) {
     return (
-      <div className="h-screen flex flex-col items-center justify-center bg-[#0e1621] text-white">
-        <HeartIcon size={64} className="text-pink-500 animate-pulse mb-4" />
-        <p className="text-sm text-slate-400">
-          Menemukan ruang cinta...
-        </p>
+      <div className="min-h-screen flex items-center justify-center bg-slate-950">
+        <div className="text-center">
+          <div className="w-16 h-16 border-4 border-pink-500/20 border-t-pink-500 rounded-full animate-spin mx-auto mb-4" />
+          <p className="text-pink-500 font-bold">Menghubungkan Hati...</p>
+        </div>
       </div>
     );
   }
 
-  // ===============================
-  // ROUTING
-  // ===============================
   return (
     <Router>
       <Routes>
-        {!user ? (
-          <>
-            <Route path="/login" element={<Login />} />
-            <Route path="*" element={<Navigate to="/login" />} />
-          </>
-        ) : (
-          <Route
-            path="/"
-            element={<Layout user={user} />}
-          >
-            <Route index element={<Dashboard />} />
+        <Route
+          path="/login"
+          element={!currentUser ? <Login /> : <Navigate to="/" />}
+        />
+
+        {currentUser ? (
+          <Route element={<Layout user={currentUser} />}>
+            <Route path="/" element={<Dashboard user={currentUser} users={users} />} />
             <Route
-              path="chat"
+              path="/chat"
               element={
                 <ChatPage
-                  user={user}
+                  user={currentUser}
                   users={users}
                   messages={messages}
                   setMessages={setMessages}
@@ -129,22 +124,30 @@ const App: React.FC = () => {
               }
             />
             <Route
-              path="chat/:partnerId"
+              path="/chat/:partnerId"
               element={
                 <ChatPage
-                  user={user}
+                  user={currentUser}
                   users={users}
                   messages={messages}
                   setMessages={setMessages}
                 />
               }
             />
-            <Route path="savings" element={<SavingsPage />} />
-            <Route path="gallery" element={<GalleryPage />} />
-            <Route path="admin" element={<AdminPage />} />
+            <Route path="/savings" element={<SavingsPage />} />
+            <Route path="/gallery" element={<GalleryPage />} />
+            {currentUser.role === 'admin' && <Route path="/admin" element={<AdminPage />} />}
           </Route>
+        ) : (
+          <Route path="*" element={<Navigate to="/login" />} />
         )}
       </Routes>
+
+      {initError && (
+        <div className="fixed bottom-4 right-4 bg-red-500 text-white p-4 rounded-xl">
+          <ShieldCheck /> {initError}
+        </div>
+      )}
     </Router>
   );
 };
