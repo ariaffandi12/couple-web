@@ -1,0 +1,8 @@
+{
+  "name": "AuraCouple - Romantic Couple's Space",
+  "description": "A private, modern romantic space for couples to chat, save money together, and share a photo gallery with an AI assistant.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
