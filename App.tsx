@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { HashRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
 import { User, Saving, GalleryPhoto, Message } from './types';
 import Login from './pages/Login';
@@ -11,7 +11,6 @@ import AdminPage from './pages/AdminPage';
 import Layout from './components/Layout';
 import { db } from './services/databaseService';
 import { supabase, isSupabaseConfigured } from './services/supabaseClient';
-// Import missing icons from lucide-react
 import { Heart as HeartIcon, ShieldCheck } from 'lucide-react';
 
 const App: React.FC = () => {
@@ -23,10 +22,11 @@ const App: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [initError, setInitError] = useState<string | null>(null);
 
-  // Fungsi untuk memuat data di latar belakang
-  const loadBackgroundData = async () => {
+  // Memoized load function to prevent unnecessary re-renders
+  const loadBackgroundData = useCallback(async () => {
+    if (!isSupabaseConfigured) return;
     try {
-      console.log("AuraCouple: Menarik data dari database...");
+      console.log("AuraCouple: Menyinkronkan seluruh data...");
       const [usersData, savingsData, messagesData, photosData] = await Promise.all([
         db.getUsers().catch(() => []),
         db.getSavings().catch(() => []),
@@ -38,19 +38,18 @@ const App: React.FC = () => {
       setSavings(savingsData);
       setMessages(messagesData);
       setPhotos(photosData);
-      console.log(`AuraCouple: Sinkronisasi selesai. (${messagesData.length} pesan dimuat)`);
+      console.log(`AuraCouple: Berhasil memuat ${messagesData.length} riwayat pesan.`);
     } catch (err) {
-      console.error("AuraCouple Error: Gagal memuat data latar belakang:", err);
+      console.error("AuraCouple Sync Error:", err);
     }
-  };
+  }, []);
 
   useEffect(() => {
     let mounted = true;
 
-    // Safety Timeout: Maksimal loading 5 detik
     const safetyTimer = setTimeout(() => {
       if (loading && mounted) {
-        console.warn("AuraCouple: Loading terlalu lama, memaksa masuk...");
+        console.warn("AuraCouple: Menunggu database terlalu lama, paksa buka aplikasi.");
         setLoading(false);
       }
     }, 5000);
@@ -58,7 +57,7 @@ const App: React.FC = () => {
     const initApp = async () => {
       if (!isSupabaseConfigured) {
         if (mounted) {
-          setInitError("Database belum terkonfigurasi.");
+          setInitError("Konfigurasi database tidak valid.");
           setLoading(false);
         }
         return;
@@ -66,31 +65,26 @@ const App: React.FC = () => {
 
       try {
         const { data: { session }, error: sessionError } = await supabase.auth.getSession();
-        
         if (sessionError) throw sessionError;
 
         if (session?.user) {
-          try {
-            const profile = await db.getProfile(session.user.id);
-            if (mounted) {
-              if (profile) {
-                setCurrentUser(profile);
-                loadBackgroundData();
-              } else {
-                console.warn("Profil tidak ditemukan, logout otomatis.");
-                await supabase.auth.signOut();
-                setCurrentUser(null);
-              }
+          const profile = await db.getProfile(session.user.id);
+          if (mounted) {
+            if (profile) {
+              setCurrentUser(profile);
+              await loadBackgroundData();
+            } else {
+              console.warn("Sesi aktif tanpa profil, keluar otomatis.");
+              await supabase.auth.signOut();
             }
-          } catch (profileErr) {
-            console.error("Gagal ambil profil:", profileErr);
           }
         }
       } catch (error: any) {
-        console.error("Init Error:", error);
+        console.error("App Init Error:", error);
         if (mounted) setInitError(error.message);
       } finally {
         if (mounted) {
+          setLoading(true); // Biarkan tetap true jika profile baru mau dimuat
           setLoading(false);
           clearTimeout(safetyTimer);
         }
@@ -100,7 +94,7 @@ const App: React.FC = () => {
     initApp();
 
     const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, session) => {
-      console.log(`Auth Change: ${event}`);
+      console.log(`Aura Auth Event: ${event}`);
       if (event === 'SIGNED_IN' && session?.user) {
         const profile = await db.getProfile(session.user.id);
         if (mounted && profile) {
@@ -114,7 +108,6 @@ const App: React.FC = () => {
           setMessages([]);
           setSavings([]);
           setPhotos([]);
-          setLoading(false);
         }
       }
     });
@@ -124,36 +117,63 @@ const App: React.FC = () => {
       subscription.unsubscribe();
       clearTimeout(safetyTimer);
     };
-  }, []);
+  }, [loadBackgroundData]);
 
-  // Real-time listener: Menangkap pesan dari pasangan saat offline/online
+  // SYSTEM REALTIME: Inti dari pengiriman pesan antar pengguna
   useEffect(() => {
     if (!isSupabaseConfigured || !currentUser) return;
 
-    const channel = supabase
-      .channel('public:messages')
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, (payload) => {
-        const m = payload.new;
-        if (!m.chat_id.includes(currentUser.uid)) return; // Pastikan pesan untuk saya
+    console.log(`AuraRealtime: Menghubungkan ke jalur pesan untuk ${currentUser.displayName}...`);
 
-        const newMsg: Message = {
-          messageId: m.id,
-          chatId: m.chat_id,
-          senderId: m.sender_id || 'aura-ai',
-          text: m.text,
-          timestamp: new Date(m.created_at).getTime(),
-          isAi: m.is_ai,
-          metadata: m.metadata
-        };
-        
-        setMessages(prev => {
-          if (prev.some(x => x.messageId === newMsg.messageId)) return prev;
-          return [...prev, newMsg];
-        });
-      })
-      .subscribe();
+    // Gunakan nama channel unik per user untuk reliabilitas tinggi
+    const channel = supabase
+      .channel(`auracouple-chat-${currentUser.uid}`)
+      .on(
+        'postgres_changes', 
+        { 
+          event: 'INSERT', 
+          schema: 'public', 
+          table: 'messages' 
+        }, 
+        (payload) => {
+          const m = payload.new;
+          console.log("AuraRealtime: Ada data masuk!", m);
+
+          // Cek apakah pesan ini milik percakapan user saat ini
+          if (m.chat_id && m.chat_id.includes(currentUser.uid)) {
+            const newMsg: Message = {
+              messageId: m.id,
+              chatId: m.chat_id,
+              senderId: m.sender_id || 'aura-ai',
+              text: m.text,
+              timestamp: new Date(m.created_at).getTime(),
+              isAi: m.is_ai,
+              metadata: m.metadata
+            };
+            
+            setMessages(prev => {
+              // Hindari duplikasi jika pesan sudah ada (optimistic update)
+              if (prev.some(x => x.messageId === newMsg.messageId)) return prev;
+              console.log("AuraRealtime: Pesan baru diterima dan ditambahkan ke layar.");
+              return [...prev, newMsg];
+            });
+          }
+        }
+      )
+      .subscribe((status) => {
+        console.log(`AuraRealtime Status: ${status}`);
+        if (status === 'SUBSCRIBED') {
+          console.log("AuraRealtime: SIAP menerima pesan dari pasangan!");
+        }
+        if (status === 'CHANNEL_ERROR') {
+          console.error("AuraRealtime: Gagal berlangganan. Pastikan Realtime aktif di dashboard Supabase.");
+        }
+      });
     
-    return () => { supabase.removeChannel(channel); };
+    return () => { 
+      console.log("AuraRealtime: Memutuskan jalur pesan.");
+      supabase.removeChannel(channel); 
+    };
   }, [currentUser]);
 
   const login = (user: User) => {
@@ -164,7 +184,6 @@ const App: React.FC = () => {
   const logout = async () => {
     try {
       await supabase.auth.signOut();
-      // State dibersihkan oleh onAuthStateChange
     } catch (err) {
       console.error("Logout error", err);
       setCurrentUser(null);
@@ -182,7 +201,7 @@ const App: React.FC = () => {
         </div>
         <div className="text-center">
           <p className="text-white font-romantic text-2xl mb-1">AuraCouple</p>
-          <p className="text-slate-500 animate-pulse text-xs font-bold uppercase tracking-widest">Menyiapkan Ruang Cinta...</p>
+          <p className="text-slate-500 animate-pulse text-xs font-bold uppercase tracking-widest">Menghubungkan Hati...</p>
         </div>
       </div>
     );
